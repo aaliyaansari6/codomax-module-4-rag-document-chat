@@ -2,142 +2,103 @@ import streamlit as st
 from google import genai
 import chromadb
 from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# -----------------------------
-# Page Configuration
-# -----------------------------
 st.set_page_config(
     page_title="Chat With Your Documents",
-    page_icon="📚",
-    layout="wide"
+    page_icon="📚"
 )
 
 st.title("📚 Chat With Your Documents")
 st.caption("Codomax Internship – Module 4: RAG, Embeddings & Vector Databases")
 
-# -----------------------------
-# Gemini Client
-# -----------------------------
 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
-# -----------------------------
-# ChromaDB
-# -----------------------------
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(name="documents")
 
-collection = chroma_client.get_or_create_collection(
-    name="documents"
-)
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
-def extract_text(uploaded_file):
-    """Extract text from PDF or TXT files."""
-
-    if uploaded_file.name.lower().endswith(".pdf"):
-        reader = PdfReader(uploaded_file)
-        text = ""
-
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-
-        return text
-
-    elif uploaded_file.name.lower().endswith(".txt"):
-        return uploaded_file.read().decode("utf-8")
-
-    return ""
+if "vectorizer" not in st.session_state:
+    st.session_state.vectorizer = None
 
 
-def chunk_text(text, chunk_size=1000, overlap=200):
-    """Split document text into overlapping chunks."""
+def extract_text(file):
+    if file.name.endswith(".pdf"):
+        reader = PdfReader(file)
+        return "\n".join(
+            page.extract_text() or "" for page in reader.pages
+        )
 
+    return file.read().decode("utf-8")
+
+
+def chunk_text(text, size=1000, overlap=200):
     chunks = []
     start = 0
 
     while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end].strip()
+        chunk = text[start:start + size].strip()
 
         if chunk:
             chunks.append(chunk)
 
-        start += chunk_size - overlap
+        start += size - overlap
 
     return chunks
 
 
-def create_embeddings(texts):
-    """Generate embeddings using Gemini."""
-
-    response = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=texts
-    )
-
-    return [embedding.values for embedding in response.embeddings]
-
-
-def add_documents(files):
-    """Process documents and store their embeddings."""
-
+def process_documents(files):
     all_chunks = []
-    all_ids = []
 
-    for file_index, uploaded_file in enumerate(files):
+    for file in files:
+        text = extract_text(file)
 
-        text = extract_text(uploaded_file)
-
-        if not text.strip():
-            continue
-
-        chunks = chunk_text(text)
-
-        for chunk_index, chunk in enumerate(chunks):
-            all_chunks.append(chunk)
-            all_ids.append(
-                f"{uploaded_file.name}_{file_index}_{chunk_index}"
-            )
+        if text.strip():
+            all_chunks.extend(chunk_text(text))
 
     if not all_chunks:
         return 0
 
-    embeddings = create_embeddings(all_chunks)
+    vectorizer = TfidfVectorizer()
+    vectors = vectorizer.fit_transform(all_chunks).toarray()
+
+    collection.delete(
+        ids=collection.get()["ids"]
+    ) if collection.count() > 0 else None
 
     collection.add(
         documents=all_chunks,
-        embeddings=embeddings,
-        ids=all_ids
+        embeddings=vectors.tolist(),
+        ids=[f"chunk_{i}" for i in range(len(all_chunks))]
     )
+
+    st.session_state.chunks = all_chunks
+    st.session_state.vectorizer = vectorizer
 
     return len(all_chunks)
 
 
-def retrieve_context(question, top_k=3):
-    """Retrieve the most relevant document chunks."""
+def retrieve(question, top_k=3):
+    vectorizer = st.session_state.vectorizer
 
-    query_embedding = create_embeddings([question])[0]
+    if vectorizer is None:
+        return []
+
+    question_vector = vectorizer.transform([question]).toarray()
 
     results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k
+        query_embeddings=question_vector.tolist(),
+        n_results=min(top_k, collection.count())
     )
-
-    if not results["documents"]:
-        return []
 
     return results["documents"][0]
 
 
-# -----------------------------
-# Sidebar
-# -----------------------------
 st.sidebar.header("📄 Upload Documents")
 
-uploaded_files = st.sidebar.file_uploader(
+files = st.sidebar.file_uploader(
     "Upload PDF or TXT files",
     type=["pdf", "txt"],
     accept_multiple_files=True
@@ -145,17 +106,17 @@ uploaded_files = st.sidebar.file_uploader(
 
 if st.sidebar.button("➕ Process Documents"):
 
-    if not uploaded_files:
-        st.sidebar.warning("Please upload a document first.")
+    if not files:
+        st.sidebar.warning("Upload a document first.")
 
     else:
-        with st.spinner("Processing documents..."):
+        with st.spinner("Processing document..."):
 
             try:
-                count = add_documents(uploaded_files)
+                count = process_documents(files)
 
                 st.sidebar.success(
-                    f"Processed {count} document chunks successfully!"
+                    f"Processed {count} document chunks!"
                 )
 
             except Exception as e:
@@ -165,28 +126,27 @@ if st.sidebar.button("➕ Process Documents"):
 if st.sidebar.button("🗑️ Clear Database"):
 
     try:
-        chroma_client.delete_collection("documents")
+        ids = collection.get()["ids"]
 
-        collection = chroma_client.get_or_create_collection(
-            name="documents"
-        )
+        if ids:
+            collection.delete(ids=ids)
 
-        st.sidebar.success("Document database cleared.")
+        st.session_state.chunks = []
+        st.session_state.vectorizer = None
+
+        st.sidebar.success("Database cleared.")
 
     except Exception as e:
         st.sidebar.error(f"Error: {e}")
 
 
-# -----------------------------
-# Main Chat
-# -----------------------------
 st.subheader("💬 Ask Questions About Your Documents")
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 
-for message in st.session_state.chat_history:
+for message in st.session_state.messages:
 
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -199,11 +159,8 @@ question = st.chat_input(
 
 if question:
 
-    st.session_state.chat_history.append(
-        {
-            "role": "user",
-            "content": question
-        }
+    st.session_state.messages.append(
+        {"role": "user", "content": question}
     )
 
     with st.chat_message("user"):
@@ -211,27 +168,21 @@ if question:
 
     try:
 
-        with st.spinner("Searching your documents..."):
-
-            context_chunks = retrieve_context(question)
-
-        if not context_chunks:
-
-            answer = (
-                "I couldn't find any relevant information. "
-                "Please upload and process a document first."
-            )
+        if collection.count() == 0:
+            answer = "Please upload and process a document first."
 
         else:
+
+            context_chunks = retrieve(question)
 
             context = "\n\n---\n\n".join(context_chunks)
 
             prompt = f"""
 You are a document question-answering assistant.
 
-Answer the user's question using ONLY the provided document context.
+Use ONLY the provided document context to answer the question.
 
-If the answer cannot be found in the context, clearly say:
+If the answer is not present in the context, say:
 "I could not find this information in the uploaded documents."
 
 Do not invent information.
@@ -239,7 +190,7 @@ Do not invent information.
 DOCUMENT CONTEXT:
 {context}
 
-USER QUESTION:
+QUESTION:
 {question}
 """
 
@@ -253,13 +204,9 @@ USER QUESTION:
         with st.chat_message("assistant"):
             st.markdown(answer)
 
-        st.session_state.chat_history.append(
-            {
-                "role": "assistant",
-                "content": answer
-            }
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer}
         )
 
     except Exception as e:
-
-        st.error(f"Error while processing your question: {e}")
+        st.error(f"Error: {e}")
